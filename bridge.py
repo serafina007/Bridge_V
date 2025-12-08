@@ -52,84 +52,71 @@ def scan_blocks(chain, contract_info="contract_info.json"):
     #YOUR CODE HERE
     w3 = connect_to(chain)
 
-    # Load contract info for the scanned chain
+    # load contract
     info = get_contract_info(chain, contract_info)
-    src_address = info["address"]
-    src_abi = info["abi"]
-    src_contract = w3.eth.contract(address=src_address, abi=src_abi)
+    bridge_addr = info["address"].lower()
+    abi = info["abi"]
+    bridge = w3.eth.contract(address=info["address"], abi=abi)
 
-    # Scan last 5 blocks
-    latest = w3.eth.get_block_number()
+    # scan last 5 blocks
+    latest = w3.eth.block_number
     start = max(0, latest - 5)
 
-    if chain == "source":
-        event_type = "Deposit"
-    else:
-        event_type = "Unwrap"
-
+    # --- instead of Deposit/Unwrap, scan ALL logs ---
     try:
-        event_filter = getattr(src_contract.events, event_type).create_filter(
-            from_block=start,
-            to_block=latest
+        events = bridge.events.Transfer().get_logs(
+            fromBlock=start,
+            toBlock=latest
         )
-        events = event_filter.get_all_entries()
     except:
-        print(f"No {event_type} event type present in ABI on {chain}")
+        print(f"No Transfer event in ABI on {chain}")
         return
 
     if not events:
-        print(f"No {event_type} events found on {chain} ({start} → {latest})")
+        print(f"No Transfer events on {chain} ({start}→{latest})")
         return
 
-    # Determine target chain
-    target_chain = "destination" if chain == "source" else "source"
-
-    # Connect to the target chain
-    w3t = connect_to(target_chain)
-
-    # Load target chain contract info
-    tgt = get_contract_info(target_chain, contract_info)
-    tgt_address = tgt["address"]
+    # determine counterpart
+    other = "destination" if chain == "source" else "source"
+    w3o = connect_to(other)
+    tgt = get_contract_info(other, contract_info)
+    tgt_addr = tgt["address"]
     tgt_abi = tgt["abi"]
-    tgt_contract = w3t.eth.contract(address=tgt_address, abi=tgt_abi)
+    wrapped = w3o.eth.contract(address=tgt_addr, abi=tgt_abi)
 
-    # Warden signing
-    warden_sk = int(tgt["warden_sk"], 16)
-    acct = w3t.eth.account.from_key(warden_sk)
+    # warden signs
+    warden = w3o.eth.account.from_key(int(tgt["warden_sk"], 16))
 
-    # -------- PROCESS EVENTS --------
-    for e in events:
+    for ev in events:
+        args = ev["args"]
+        sender = args["from"].lower()
+        receiver = args["to"].lower()
+        amount = args["value"]
 
-        # ============ SOURCE → DESTINATION (wrap) ============
-        if chain == "source":    
-            token = e["args"]["token"]
-            recip = e["args"]["recipient"]
-            amount = e["args"]["amount"]
+        # ===================== SOURCE → DEST =====================
+        if chain == "source" and receiver == bridge_addr:
 
-            tx = tgt_contract.functions.wrap(token, recip, amount).build_transaction({
-                "from": acct.address,
-                "nonce": w3t.eth.get_transaction_count(acct.address),
+            tx = wrapped.functions.mint(sender, amount).build_transaction({
+                "nonce": w3o.eth.get_transaction_count(warden.address),
                 "gas": 500_000,
-                "gasPrice": w3t.eth.gas_price
+                "from": warden.address,
+                "gasPrice": w3o.eth.gas_price
             })
-            signed = w3t.eth.account.sign_transaction(tx, warden_sk)
-            txh = w3t.eth.send_raw_transaction(signed.rawTransaction)
-            print(f"[BRIDGE] wrap sent → {txh.hex()}")
-            return 1   # important: do NOT reprocess multiple events
+            signed = warden.sign_transaction(tx)
+            txh = w3o.eth.send_raw_transaction(signed.rawTransaction)
+            print(f"[BRIDGE] Mint on {other}: {txh.hex()}")
+            return 1
 
-        # ============ DESTINATION → SOURCE (withdraw) ============
-        else:
-            wtoken = e["args"]["wrappedToken"]
-            recip  = e["args"]["recipient"]
-            amount = e["args"]["amount"]
+        # ===================== DEST → SOURCE =====================
+        if chain == "destination" and sender == bridge_addr:
 
-            tx = tgt_contract.functions.withdraw(wtoken, recip, amount).build_transaction({
-                "from": acct.address,
-                "nonce": w3t.eth.get_transaction_count(acct.address),
+            tx = wrapped.functions.withdraw(sender, amount).build_transaction({
+                "nonce": w3o.eth.get_transaction_count(warden.address),
                 "gas": 500_000,
-                "gasPrice": w3t.eth.gas_price
+                "from": warden.address,
+                "gasPrice": w3o.eth.gas_price
             })
-            signed = w3t.eth.account.sign_transaction(tx, warden_sk)
-            txh = w3t.eth.send_raw_transaction(signed.rawTransaction)
-            print(f"[BRIDGE] withdraw sent → {txh.hex()}")
+            signed = warden.sign_transaction(tx)
+            txh = w3o.eth.send_raw_transaction(signed.rawTransaction)
+            print(f"[BRIDGE] Burn on {other}: {txh.hex()}")
             return 1
