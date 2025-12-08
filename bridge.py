@@ -50,82 +50,125 @@ def scan_blocks(chain, contract_info="contract_info.json"):
         return 0
     
     #YOUR CODE HERE
-    w3 = connect_to(chain)
-    info = get_contract_info(chain, contract_info)
-    
-    contract = w3.eth.contract(
-        address=Web3.to_checksum_address(info["address"]),
-        abi=info["abi"]
-    )
-    
-    latest_block = w3.eth.get_block_number()
-    start_block = max(0, latest_block - 5)
-    
-    # Event type
-    event_name = "Deposit" if chain == "source" else "Unwrap"
-    
-    try:
-        event_filter = getattr(contract.events, event_name).create_filter(
-            from_block=start_block, to_block=latest_block
-        )
-        events = event_filter.get_all_entries()
-    except Exception:
-        print(f"No {event_name} event in ABI on {chain}")
-        return
-    
-    if not events:
-        print(f"No {event_name} events found on {chain} ({start_block} → {latest_block})")
-        return
-    
-    # Determine target chain
-    target_chain = "destination" if chain == "source" else "source"
-    w3_target = connect_to(target_chain)
-    tgt_info = get_contract_info(target_chain, contract_info)
-    tgt_contract = w3_target.eth.contract(
-        address=Web3.to_checksum_address(tgt_info["address"]),
-        abi=tgt_info["abi"]
-    )
-    
-    # Warden account
-    warden_sk = int(tgt_info["warden_sk"], 16)
-    warden_acct = w3_target.eth.account.from_key(warden_sk)
-    
-    # Process events
-    for e in events:
-        if chain == "source":  # Deposit → wrap
-            token = e["args"]["token"]
-            recipient = e["args"]["recipient"]
-            amount = e["args"]["amount"]
-            
-            tx = tgt_contract.functions.wrap(token, recipient, amount).build_transaction({
-                "from": warden_acct.address,
-                "nonce": w3_target.eth.get_transaction_count(warden_acct.address),
-                "gas": 500_000,
-                "gasPrice": w3_target.eth.gas_price
-            })
-            signed_tx = w3_target.eth.account.sign_transaction(tx, private_key=warden_sk)
-            tx_hash = w3_target.eth.send_raw_transaction(signed_tx.rawTransaction)
-            print(f"[BRIDGE] wrap called → {tx_hash.hex()}")
-        
-        else:  # Destination → Source (Unwrap → withdraw)
-            wtoken = e["args"]["wrappedToken"]
-            recipient = e["args"]["recipient"]
-            amount = e["args"]["amount"]
-            
-            tx = tgt_contract.functions.withdraw(wtoken, recipient, amount).build_transaction({
-                "from": warden_acct.address,
-                "nonce": w3_target.eth.get_transaction_count(warden_acct.address),
-                "gas": 500_000,
-                "gasPrice": w3_target.eth.gas_price
-            })
-            signed_tx = w3_target.eth.account.sign_transaction(tx, private_key=warden_sk)
-            tx_hash = w3_target.eth.send_raw_transaction(signed_tx.rawTransaction)
-            print(f"[BRIDGE] withdraw called → {tx_hash.hex()}")
-        
-        # Only process one event at a time to avoid duplicates
-        return
+    source_info = get_contract_info('source', contract_info)
+    dest_info = get_contract_info('destination', contract_info)
 
-# -------- MAIN --------
-if __name__ == "__main__":
-    scan_blocks("source")       # Scan source for Deposit → wrap
-    scan_blocks("destination")
+    if not source_info or not dest_info:
+        print("Error loading contract info.")
+        return 0
+
+    # 2. Establish Connections to Both Chains
+    w3_source = connect_to('source')
+    w3_dest = connect_to('destination')
+
+    # 3. Load the Warden's Private Key
+    # We assume the key is stored in 'secret_key.txt' as per Bridge I
+    try:
+        with open("secret_key.txt", "r") as f:
+            private_key = f.read().strip()
+        warden_account = Account.from_key(private_key)
+        warden_address = warden_account.address
+        print(f"Warden Address: {warden_address}")
+    except Exception as e:
+        print(f"Could not load private key: {e}")
+        return 0
+
+    # 4. Define Logic based on the chain being scanned
+    
+    # --- SCENARIO A: Scanning Source (Avalanche) for Deposits ---
+    if chain == 'source':
+        print("Scanning Source Chain (Avalanche) for Deposit events...")
+        
+        # Initialize Contracts
+        source_contract = w3_source.eth.contract(address=source_info['address'], abi=source_info['abi'])
+        dest_contract = w3_dest.eth.contract(address=dest_info['address'], abi=dest_info['abi'])
+
+        # Define Block Range (Last 5 blocks)
+        try:
+            current_block = w3_source.eth.get_block_number()
+            start_block = current_block - 5
+            
+            # Filter for Deposit events
+            event_filter = source_contract.events.Deposit.create_filter(from_block=start_block, to_block=current_block)
+            events = event_filter.get_all_entries()
+            
+            # Get initial nonce for the Destination chain (where we will write)
+            nonce = w3_dest.eth.get_transaction_count(warden_address)
+
+            for event in events:
+                args = event['args']
+                token = args['token']
+                recipient = args['recipient']
+                amount = args['amount']
+                
+                print(f"Event found: Deposit {amount} of {token} for {recipient}")
+
+                # Action: Call wrap() on Destination
+                # Function signature: wrap(address _underlying_token, address _recipient, uint256 _amount)
+                tx = dest_contract.functions.wrap(token, recipient, amount).build_transaction({
+                    'chainId': 97, # BSC Testnet Chain ID
+                    'gas': 2000000,
+                    'gasPrice': w3_dest.eth.gas_price,
+                    'nonce': nonce
+                })
+
+                # Sign and Send
+                signed_tx = w3_dest.eth.account.sign_transaction(tx, private_key)
+                tx_hash = w3_dest.eth.send_raw_transaction(signed_tx.rawTransaction)
+                print(f"Sent Wrap transaction to BSC: {tx_hash.hex()}")
+                
+                # Increment nonce for next transaction in loop
+                nonce += 1
+
+        except Exception as e:
+            print(f"Error scanning source or sending wrap: {e}")
+
+
+    # --- SCENARIO B: Scanning Destination (BSC) for Unwraps ---
+    elif chain == 'destination':
+        print("Scanning Destination Chain (BSC) for Unwrap events...")
+        
+        # Initialize Contracts
+        dest_contract = w3_dest.eth.contract(address=dest_info['address'], abi=dest_info['abi'])
+        source_contract = w3_source.eth.contract(address=source_info['address'], abi=source_info['abi'])
+
+        # Define Block Range (Last 5 blocks)
+        try:
+            current_block = w3_dest.eth.get_block_number()
+            start_block = current_block - 5
+            
+            # Filter for Unwrap events
+            event_filter = dest_contract.events.Unwrap.create_filter(from_block=start_block, to_block=current_block)
+            events = event_filter.get_all_entries()
+            
+            # Get initial nonce for the Source chain (where we will write)
+            nonce = w3_source.eth.get_transaction_count(warden_address)
+
+            for event in events:
+                args = event['args']
+                # Event signature: Unwrap(address indexed underlying_token, address indexed wrapped_token, address frm, address indexed to, uint256 amount)
+                underlying_token = args['underlying_token']
+                recipient = args['to']
+                amount = args['amount']
+                
+                print(f"Event found: Unwrap {amount} of {underlying_token} for {recipient}")
+
+                # Action: Call withdraw() on Source
+                # Function signature: withdraw(address _token, address _recipient, uint256 _amount)
+                tx = source_contract.functions.withdraw(underlying_token, recipient, amount).build_transaction({
+                    'chainId': 43113, # Avalanche Fuji Testnet Chain ID
+                    'gas': 2000000,
+                    'gasPrice': w3_source.eth.gas_price,
+                    'nonce': nonce
+                })
+
+                # Sign and Send
+                signed_tx = w3_source.eth.account.sign_transaction(tx, private_key)
+                tx_hash = w3_source.eth.send_raw_transaction(signed_tx.rawTransaction)
+                print(f"Sent Withdraw transaction to Avalanche: {tx_hash.hex()}")
+                
+                # Increment nonce for next transaction in loop
+                nonce += 1
+
+        except Exception as e:
+            print(f"Error scanning destination or sending withdraw: {e}")
